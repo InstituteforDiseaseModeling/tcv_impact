@@ -1,0 +1,819 @@
+---
+output: 
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    code_folding: hide
+---
+
+# Population impact of TCV
+
+In this script, we will use surveillance data and a pre-post analysis to estimate population-level reductions in typhoid incidence as a result of vaccination activities.
+
+Follow the instructions in this script to generate preliminary visualizations of your data, define models of typhoid impact, and produce harmonized output for cross-site comparisons of impact. Most of the code should run without any changes. Where changes are needed (e.g., changing a file path or name), you will see the flag `# UPDATE` in the code.
+
+```{r setup, include=FALSE}
+
+  knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+
+  library(tidyverse)
+  library(scales)
+  library(cowplot)
+  library(gt)
+  library(glue)
+  library(readxl)
+  library(checkmate)
+  library(testthat)
+
+  select = dplyr::select
+  
+  # This reads in necessary custom functions from the file tcv-impact-functions.R
+  # Make sure that file exists in the same directory as the Rmd
+  source("tcv-impact-functions.R")
+  
+```
+
+```{r defaults}
+
+  # This chunk defines a few helpful defaults we'll use throughout the document
+
+  # color-blind friendly palettes
+  col2 = c("#D59A6B", "#4F9E89")
+  col5 <- c("#947db5", "#D59A6B", "#4F9E89", "#E78AC3", "#4555ff")
+
+  # age group labels
+  age_cat_labels = c("0-2y", "2-5y", "5-15y", "15y+")
+
+  # UPDATE: add your site name here, which will be used in certain figures and output
+  site_name = "fake-data"
+  
+```
+
+# Data exploration
+
+## Data import & checks
+
+Change the file path below to the location and name of your impact dataset. Note that by default, Rmd files will set the working directory as the location to which the Rmd is saved. You can run the `getwd()` command inside the code chunk if you're unsure where this is. You can also provide an absolute file path (i.e., starting with `~/`), which will work regardless of the working directory of this document.
+
+```{r load data}
+
+  # uncomment the line below if you need to print the working directory of the Rmd file
+  # getwd()
+
+  # UPDATE: change the file path below to the path and name of your Excel file
+  df_filepath = "data/FakeData_workshop.xlsx"
+
+  # Read in each of the relevant data frames:
+  df_cases <- read_excel(df_filepath, "cases")
+  df_pop <- read_excel(df_filepath, "population")
+  df_vxcov <- read_excel(df_filepath, "vaccine_coverage")
+  
+```
+
+We'll now perform a few checks of these data frames to ensure the formatting is appropriate for the analysis below. If any error messages appear below, please ask a workshop facilitator for help.
+
+```{r data checks, warning=TRUE, error=TRUE, message=TRUE}
+
+  # confirm expected columns are present + appropriately named
+  expected_case_columns = c("month", "year", "age_group", "typhoid_cases", "typhoid_cases_severe", "culture_volume")
+  expected_population_columns = c("month", "year", "age_group", "population")
+  expected_vxcov_columns = c("month", "year", "coverage_all", "coverage_u15", "coverage_u2", "coverage_type")
+  
+  expect_names(names(df_cases), must.include=expected_case_columns, label="Typhoid case data")
+  expect_names(names(df_pop), must.include=expected_population_columns, label="Population data")
+  expect_names(names(df_vxcov), must.include=expected_vxcov_columns, label="Vaccine coverage data")
+  
+  # confirm data types + missingness
+  expect_numeric(df_cases$month, any.missing=FALSE, finite=TRUE, lower=1, upper=12)
+  expect_numeric(df_cases$year, any.missing=FALSE, finite=TRUE, lower=0)
+  expect_numeric(df_cases$typhoid_cases, lower=0)
+  expect_numeric(df_cases$typhoid_cases_severe, lower=0)
+  expect_numeric(df_cases$culture_volume, lower=0)
+
+  expect_numeric(df_pop$month, any.missing=FALSE, finite=TRUE, lower=1, upper=12)
+  expect_numeric(df_pop$year, any.missing=FALSE, finite=TRUE, lower=0)
+  expect_numeric(df_pop$population, any.missing=FALSE, finite=TRUE, lower=0)
+  
+  expect_numeric(df_vxcov$month, any.missing=FALSE, finite=TRUE, lower=1, upper=12)
+  expect_numeric(df_vxcov$year, any.missing=FALSE, finite=TRUE, lower=0)
+  expect_numeric(df_vxcov$coverage_all, lower=0, upper=100)
+  expect_numeric(df_vxcov$coverage_u15, lower=0, upper=100)
+  expect_numeric(df_vxcov$coverage_u2, lower=0, upper=100)
+
+  expect_subset(df_cases$age_group, choices = age_cat_labels)
+  expect_subset(df_pop$age_group, choices = age_cat_labels)
+
+  # display missingness or duplication in case and population data
+  missing_cases <- df_cases %>% filter(is.na(typhoid_cases) | is.infinite(typhoid_cases))
+
+  if(nrow(missing_cases)>0){
+    warning("The following months/age groups have 'NA' recorded case data. Did you mean for this to be 0 cases?")
+    print(missing_cases)
+  }
+  
+  # check every age group has recorded cases for all case month/year combos - or should they be 0s
+  max_yrs = df_cases %>% 
+    distinct(month, year) %>%
+    expand_grid(age_group = age_cat_labels)
+  missing_age_cases <- max_yrs %>%
+    anti_join(
+      df_cases %>% filter(!is.na(typhoid_cases)),
+      by=c("month", "year", "age_group")
+    )
+  
+  if(nrow(missing_age_cases)>0){
+    warning("The following months/age groups have no recorded case data. Did you mean for this to be 0 cases?")
+    print(missing_age_cases)
+  }
+  
+  missing_pop <- df_pop %>% filter(is.na(population) | is.infinite(population))
+
+  if(nrow(missing_pop)>0){
+    warning("The following months/age groups have no recorded population.")
+    print(missing_pop)
+  }
+  
+  # check duplication in case and population data
+  duplicated_cases <- df_cases %>% select(month, year, age_group) %>% filter(duplicated(.))
+  if(nrow(duplicated_cases)>0){
+    warning("The following months/age groups have multiple rows of typhoid case data. Should one row be deleted or combined with the other?")
+    print(duplicated_cases)
+  }
+  
+  duplicated_pop <- df_pop %>% select(month, year, age_group) %>% filter(duplicated(.))
+  if(nrow(duplicated_pop)>0){
+    warning("The following months/age groups have multiple rows of population data. Should one row be deleted or combined with the other?")
+    print(duplicated_pop)
+  }
+  
+  # check all case month/year/age group combos have associated population data
+  missing_pop_vs_case <- df_cases %>%
+    select(month, year, age_group) %>%
+    distinct() %>%
+    anti_join(
+      df_pop %>% select(month, year, age_group),
+      by=c("month", "year", "age_group")
+    )
+  
+   if(nrow(missing_pop_vs_case)>0){
+    warning("The following months/age groups within the case data do not have corresponding population data. Please check your population data/interpolation")
+    print(missing_pop_vs_case)
+  }
+  
+```
+
+
+## Data wrangling
+
+We'll now merge together the population and case data, and create a combined dataset that summarizes both cases and population across age categories. We'll calculate typhoid incidence and percent positivity for each dataset. We'll also do a little extra data formatting for plotting. **These are the final datasets we will use for visualization and analysis below.**
+
+```{r data merge}
+
+  # combining case & population data
+  df_ages <- df_cases %>%
+    left_join(df_pop, by = c("month", "year", "age_group"))
+  
+  # aggregating by age
+  df_allage <- df_ages %>%
+    group_by(month, year) %>%
+    summarise(across(c(typhoid_cases, typhoid_cases_severe, culture_volume, population), sum))
+  
+  # calculating incidence per 100K person-years, % positivity
+  df_ages <- df_ages %>%
+    mutate(
+      inc_per_100k = typhoid_cases / (population * 1/12) * 100000, # 1/12 to convert to person-years
+      inc_severe_per_100k = typhoid_cases_severe / (population * 1/12) * 100000,
+      pct_pos = typhoid_cases / culture_volume
+    )
+  
+  df_allage <- df_allage %>%
+    mutate(
+      inc_per_100k = typhoid_cases / (population * 1/12) * 100000,
+      inc_severe_per_100k = typhoid_cases_severe / (population * 1/12) * 100000,
+      pct_pos = typhoid_cases / culture_volume
+    )
+  
+  # adding some nice labels/dates
+  # also creating a `time` variable, which tracks years since first observation 
+  # for purposes of calculating secular trends in incidence
+  df_ages <- df_ages %>%
+    mutate(
+      age_fac = factor(age_group, levels=age_cat_labels, ordered=T),
+      date = as_date(glue("{year}-{month}-01"), format="%Y-%m-%d")
+    ) %>%
+    arrange(date) %>%
+    mutate(
+      time = as.numeric(date - date[1])/365 # time in years
+    )
+  
+  df_allage <- df_allage %>%
+    ungroup() %>%
+    mutate(
+      date = as_date(glue("{year}-{month}-01"), format="%Y-%m-%d")
+    ) %>%
+    arrange(date) %>%
+    mutate(
+      time = as.numeric(date - date[1])/365 # time in years
+    )
+  
+  df_vxcov <- df_vxcov %>%
+    mutate(
+      date = as_date(glue("{year}-{month}-01"), format="%Y-%m-%d")
+    )
+  
+  # put vaccine coverage in long format
+  df_vxcov_long <- df_vxcov %>% 
+    pivot_longer(c("coverage_all", "coverage_u15", "coverage_u2"), names_to="age", values_to = "coverage", names_prefix = "coverage_") %>%
+    mutate(age_group = factor(age, levels=c("u2", "u15", "all"), labels=c("<2y", "<15y", "All"), ordered=T))
+  
+```
+
+
+## Visualizations
+
+We will now plot a few key figures that will help guide the remainder of our analytic choices. Note that there may appear to be blank panels in this figure if culture volume or vaccine coverage data are missing.
+
+```{r, fig.height=6, fig.width=8}
+
+  # overall incidence
+  p1 <- ggplot(data=df_allage, aes(x=date, y=inc_per_100k)) +
+    geom_line() +
+    scale_x_date("") +
+    scale_y_continuous("Incidence per 100K person-years") +
+    theme_bw()
+
+  # incidence by age
+  p2 <- ggplot(data=df_ages, aes(x=date, y=inc_per_100k, group=age_fac, color=age_fac)) +
+    geom_line() +
+    scale_x_date("") +
+    scale_y_continuous("Incidence per 100K person-years") +
+    scale_color_manual("Age", values=col5) +
+    theme_bw()
+
+  # if pct pos is not mostly missing (i.e. little/no culture data), plot
+  # overall test positivity
+  if(mean(is.na(df_allage$pct_pos))<0.5){
+    p3 <- ggplot(data=df_allage, aes(x=date, y=pct_pos)) +
+      geom_line() +
+      scale_x_date("") +
+      scale_y_continuous("Percent culture positive for S. typhi", labels=percent, limits=c(0, 1)) +
+      theme_bw()
+  }else{
+    p3 = ggplot() + geom_blank() + theme_bw()
+  }
+  
+  # if any of the vaccine coverage data are mostly not missing, plot
+  # vaccine coverage
+  if(
+    nrow(df_vxcov)>0 & 
+    (
+      mean(is.na(df_vxcov$coverage_all))<0.5 | 
+      mean(is.na(df_vxcov$coverage_u15))<0.5 | 
+      mean(is.na(df_vxcov$coverage_u2))<0.5
+    )
+  ){
+    p4 <- ggplot(data=df_vxcov_long, aes(x=date, y=coverage, color=age_group)) +
+      geom_line() +
+      scale_x_date("") +
+      scale_y_continuous("Vaccine coverage", labels=~glue("{.x}%"), limits=c(0, 100)) +
+      scale_color_manual("Age", values=col5) +
+      theme_bw()
+  }else{
+    p4 = ggplot() + geom_blank() + theme_bw()
+  }
+  
+  plot_grid(p1, p2, p3, p4, nrow=2, align = "hv", labels = LETTERS[1:4])
+  
+```
+
+# Primary Analysis
+
+## Model initialization
+
+Based on the visualizations above, we will now define key variables to be used in analysis, including the dates for pre- and post-vaccine surveillance and any excluded periods.
+
+Let's start with defining the **pre/post-vaccine indicator.**. For the purposes of our analysis, we will define a single pre-vaccine and post-vaccine period on the basis of a date (format YYYY-MM-DD) that you define below. Note that this indicator is separate from any time periods that you wish to exclude in your analysis - we will define the exclusion indicator just below. You should therefore use the first time at which vaccine was introduced, and we will handle excluding any necessary vaccine scale-up periods below. 
+
+```{r pre-post definition}
+
+  # UPDATE: define the date of first vaccine introduction for the pre/post indicator
+  date_firstvaccine = as_date("2019-03-01")
+
+  df_allage = create_prepost_ind(df_allage, date_firstvaccine)
+  df_ages = create_prepost_ind(df_ages, date_firstvaccine)
+  
+```
+
+Now let's define the **exclusion time periods**. You can define multiple periods to exclude from the model if needed. At a minimum, we recommend you exclude the first month following vaccine introduction, to account for delays in immune response. You should also exclude any period of vaccine scale-up immediately following introduction and any period(s) during which healthcare seeking or surveillance capacity may have been significantly impacted (e.g., due to the COVID-19 pandemic or due to severe weather events). For each period, define a start and end date (format YYYY-MM-DD) for the period which should be _excluded_.
+
+```{r exclusion definition}
+
+  # start by including all data
+  df_allage$ind_include = 1
+  df_ages$ind_include = 1
+
+  # exclude the month (30 days) after vaccine introduction
+  df_allage <- create_inclusion_ind(df_allage, start_excl=date_firstvaccine, end_excl = date_firstvaccine + 30) 
+  df_ages <- create_inclusion_ind(df_ages, start_excl=date_firstvaccine, end_excl = date_firstvaccine + 30) 
+  
+  # UPDATE: add in any other time periods to include (inclusive of `start_excl`, exclusive of `end_excl`)
+  # copy and paste the lines below, replacing the start and end dates of the exclusion period, as needed
+  
+  # df_allages <- create_inclusion_ind(df_allages, start_excl="2020-03-01", end_excl = "2020-08-31") 
+  # df_ages <- create_inclusion_ind(df_ages, start_excl="2020-03-01", end_excl = "2020-08-31") 
+
+```
+
+Let's remake our incidence plot now, with indications for whether data are excluded, pre-vaccine, or post-vaccine. We'll also plot the average incidence by age group in the pre- and post-vaccine periods to assess any changes in age distribution.
+
+```{r pre-post and exlusion visualization}
+
+  # incidence over time
+  ggplot(df_allage, aes(x=date, y=inc_per_100k)) +
+    geom_line(aes(linetype=fac_prepost), width=0.7, color="gray30") +
+    geom_point(aes(color=fac_include)) +
+    scale_color_manual("", values=col2) +
+    scale_linetype("") +
+    scale_x_date("") +
+    scale_y_continuous("Incidence per 100K person-years") +
+    theme_bw()
+
+  # age-specific incidence pre/post vaccine
+  tmp <- df_ages %>%
+    filter(ind_include==1) %>%
+    group_by(age_fac, fac_prepost) %>%
+    summarize(across(c(typhoid_cases, population), sum)) %>%
+    mutate(inc_per_100k = typhoid_cases / (population * 1/12) * 100000)
+
+  ggplot(tmp, aes(x=age_fac, y=inc_per_100k)) +
+    geom_col() +
+    facet_wrap(.~fac_prepost) +
+    theme_bw() +
+    labs(x="Age", y="Incidence per 100K person-years")
+  
+```
+
+
+Now let's consider whether you want to include any terms for **seasonality** in your model. This can help control for regularly occurring differences in transmission intensity or surveillance capacity across years. First, we'll plot your typhoid data by month for each year of observation, to see whether there is any obvious seasonal trend. If there is, you can define exclusive groups of months (or single months) to serve as a categorical variable in fitting. E.g., if you want to adjust for a separate rainy season from January to April and dry season from May to December, you would set `month_groups = list(1:4, 5:12)` and `month_labels = c("Rainy", "Dry")`. If you do not want to define any seasonality terms, change nothing in this chunk. Any models which require a seasonality term will automatically be dropped from analysis.
+
+```{r seasonality plot, fig.width=8, fig.height=4}
+
+  # plot incidence by month
+  p1 = ggplot(df_allage, aes(x=month, y=inc_per_100k, color=as.factor(year))) +
+    geom_line() +
+    scale_x_continuous("Month", breaks=c(1, 4, 8, 12), labels=c("Jan", "Apr", "Aug", "Dec")) +
+    scale_y_continuous("Incidence per 100K person-years") +
+    scale_color_viridis_d("Year") +
+    theme_bw()
+
+  # plot percent positivity by month
+  p2 = ggplot(df_allage, aes(x=month, y=pct_pos, color=as.factor(year))) +
+    geom_line() +
+    scale_x_continuous("Month", breaks=c(1, 4, 8, 12), labels=c("Jan", "Apr", "Aug", "Dec")) +
+    scale_y_continuous("Percent culture positive for S. typhi", labels=percent, limits=c(0, 1)) +
+    scale_color_viridis_d("Year") +
+    theme_bw()
+  
+  plot_grid(p1, p2, nrow=1, labels=LETTERS[1:2])
+  
+```
+
+```{r seasonality define}
+
+  # UPDATE: define any month groupings or labels if you would like to include a seasonality term in your model
+  # month_groups should be a list with the month(s) to include in each category
+  # month_labels should be vector of the labels for each category (completely customizable)
+  # seasonality should be TRUE if you decide to define/use a seasonality term
+  month_groups = NULL
+  month_labels = NULL
+  seasonality = FALSE
+  # month_groups = list(1:8, 9:12) # example
+  # month_labels = c("Low", "High") # example
+  # seasonality = TRUE # example
+  
+  if(seasonality){
+    
+    stopifnot("You must provide both month_groups and month_labels if using seasonality" = (!is.null(month_groups) & !is.null(month_labels)))
+    stopifnot("The length of month_groups and month_labels do not match. Please check inputs" = (length(month_groups) == length(month_labels)))
+
+    season_vec <- rep(NA_character_, 12)
+
+    for (i in seq_along(month_groups)) {
+      season_vec[month_groups[[i]]] <- month_labels[i]
+    }
+  
+    df_allage <- df_allage %>%
+      mutate(
+        seasonality_fac = factor(
+          season_vec[month],
+          levels = month_labels,
+          ordered = TRUE
+        )
+      )
+    
+    df_ages <- df_ages %>%
+      mutate(
+        seasonality_fac = factor(
+          season_vec[month],
+          levels = month_labels,
+          ordered = TRUE
+        )
+      )    
+  }else{
+    df_allage$seasonality_fac = NA
+    df_ages$seasonality_fac = NA
+  }
+
+```
+
+
+Let's also confirm whether there are any culture data - this will inform whether we use the 'culture adjusted' model described below:
+
+```{r check culture data}
+
+  # we (somewhat arbitrarily) set that there can be no more than 30% missingness in culture volume data
+  # otherwise, set include_culture = FALSE to those models 
+  include_culture = mean(is.na(df_ages$culture_volume)) <= 0.3
+
+```
+
+
+## Model fitting
+
+### 2-year impact
+
+We start with estimating the pooled vaccine impact for the first two years post-vaccine introduction (or, the maximum amount of post-vaccine follow-up, where it is less than two years) using the function `estimate_impact`. Note that this same function can be used to produce estimates for different time periods, including single years or extended duration of follow-up, as we demonstrate below.
+
+By default, the function `estimate_impact` will attempt to fit four models for the specific age group of interest:
+
+1. Unadjusted model: simply compares pre and post-vaccine periods
+2. Secular trends model: includes a simple linear term for time of follow-up, to adjust for any prevailing secular trend in incidence outside of vaccine impacts
+3. Culture-adjusted model (optional): adjusts for the number of typhoid culture tests conducted, if sufficient data exist (indicated by `include_culture` above)
+4. Seasonality-adjusted model (optional): adjusts for seasonal trend, if seasonality terms are included from section above (indicated by `seasonality`)
+ 
+```{r overall 2y impact}
+
+  # let's estimate impact
+  all = estimate_impact(age='All')
+  a1 = estimate_impact(age='0-2y')
+  a2 = estimate_impact(age='2-5y')
+  a3 = estimate_impact(age='5-15y')
+  a4 = estimate_impact(age='15y+')
+  
+  VEdat = bind_rows(all, a1, a2, a3, a4)
+  VEdat$time_period = "2y"
+  
+  print_estimate_table(VEdat)
+
+```
+
+We also recommend each group estimate vaccine impact separately for the first and second years after vaccine introduction. The code below demonstrates how you can use the same function, `estimate_impact` for various time windows. The function argument `end_window` defines the months since vaccine introduction at which to truncate the time series (i.e., if `end_window=24`, the code will compare all incidence from the date of vaccine introduction until 24 months later with the pre vaccine period). The argument `start_window` specifies the starting point of the time window of estimation; by default, its value is 0, but it could be set e.g. to 12 to left censor the time series and start estimating vaccine impact 1 year (12 months) after vaccine introduction.
+
+```{r yearly 2y impact}
+
+  all_y1 = estimate_impact(age='All', start_window=0, end_window=12)
+  a1_y1 = estimate_impact(age='0-2y', start_window=0, end_window=12)
+  a2_y1 = estimate_impact(age='2-5y', start_window=0, end_window=12)
+  a3_y1 = estimate_impact(age='5-15y', start_window=0, end_window=12)
+  a4_y1 = estimate_impact(age='15y+', start_window=0, end_window=12)
+  
+  all_y2 = estimate_impact(age='All', start_window=12, end_window=24)
+  a1_y2 = estimate_impact(age='0-2y', start_window=12, end_window=24)
+  a2_y2 = estimate_impact(age='2-5y', start_window=12, end_window=24)
+  a3_y2 = estimate_impact(age='5-15y', start_window=12, end_window=24)
+  a4_y2 = estimate_impact(age='15y+', start_window=12, end_window=24)
+  
+  VEdat_y1 = bind_rows(all_y1, a1_y1, a2_y1, a3_y1, a4_y1)
+  VEdat_y1$time_period = "0-1y"
+  
+  VEdat_y2 = bind_rows(all_y2, a1_y2, a2_y2, a3_y2, a4_y2)
+  VEdat_y2$time_period = "1-2y"
+  
+  # note to keep the document shorter, we're not printing these tables, but you
+  # could use the function `print_estimate_table` here if you'd like to see the full results!
+  
+```
+
+### Other time periods
+
+Now, let's consider other time periods over which we might want to estimate vaccine impact, as is appropriate given the time period of post-vaccine surveillance available. Recall that you can set `start_window` and `end_window` to various values to extend or censor the post-vaccination time series. Note that if `end_window` is greater than the duration of the full time series, the function will estimate impact through the end of the follow up period.
+
+```{r windowvar}
+
+# UPDATE: decide what other time periods of estimation are appropriate for your data, and add code here to produce those estimates
+# e.g., you may wish to estimate impact for extended duration of follow-up if you have more than 2 years of post-vaccine data
+
+# examples:
+# estimating impact in just the first year post-introduction:
+# all_y1 = estimate_impact(age="All", start_window=0, end_window=12)
+
+# estimating impact for 5 years post-introduction:
+# all_y5 = estimate_impact(age="All", start_window=0, end_window=5*12)
+
+```
+
+## Inspecting model fits
+
+Now, let's plot the output from the models.  Let's start by looking at impact over the first two years. We also plot the AIC of each of the unadjusted and adjusted models, to evaluate whether there are significant differences in fit (recall, a lower AIC is reflective of better fit _for nested models of the same dataset_, with penalty for additional model parameters. AICs are not easily comparable across models fit to different datasets). This will help us begin to understand which estimate of vaccine impact we should use for cross-site comparison.
+
+Let's look first at estimated impact from **0 to 2 years post-vaccination**.
+
+```{r plot 2y impact}
+
+  ggplot(data=VEdat, aes(x=model, y=VE, group=model)) + 
+    geom_point() +
+    geom_errorbar(aes(ymin=LCL, ymax=UCL), width=0.3) + 
+    scale_y_continuous("Total vaccine impact (%)", labels = percent) +
+    facet_wrap(~Age) +  # it may help your figure to add scales="free_y" inside the facet_wrap call
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(x="") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+
+  ggplot(data=VEdat, aes(x=model, y=AIC)) + 
+    geom_point() +
+    facet_wrap(~Age, scales="free_y") +
+    labs(x="", y="AIC") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+  
+```
+
+Now let's look at year 1 (0-12 months) vs year 2 (12-24 months).
+
+```{r}
+
+  tmp <- bind_rows(VEdat_y1, VEdat_y2) %>%
+    mutate(time_period = factor(time_period, levels=c("0-1y", "1-2y"), ordered=T))
+
+  ggplot(data=tmp, aes(x=time_period, y=VE, color=model)) + 
+    geom_point(position = position_dodge(width=0.5)) +
+    geom_errorbar(aes(ymin=LCL, ymax=UCL), width=0.3, position = position_dodge(width=0.5)) + 
+    scale_y_continuous("Total vaccine impact (%)", labels = percent) +
+    scale_color_manual(values=col5) +
+    facet_wrap(~Age) +  # it may help your figure to add scales="free_y" inside the facet_wrap call
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(x="Time period", color="Model") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle=45, hjust=1, vjust=1))
+  
+```
+
+If applicable, you may wish to generate similar figures for estimates of other follow-up periods:
+
+```{r plot other impacts}
+
+# UPDATE: you may wish to copy the plotting code above to generate plots of vaccine impact and AIC for different follow-up periods
+
+```
+
+Now we can make plots comparing fitted vs. observed incidence by age group to assess overall model fit. We use the same function as above (including the same logic around filtering for specific age groups and time periods of estimation), but now add the argument `plot_output=TRUE`. 
+
+```{r observed vs. fitted, fig.width=10, fig.height=8}
+
+  estimate_impact(age='All', plot_output = TRUE)
+
+  # we use plot_grid to combined the figures for each age group
+  plot_grid(
+    estimate_impact(age='0-2y', plot_output = TRUE),
+    estimate_impact(age='2-5y', plot_output = TRUE),
+    estimate_impact(age='5-15y', plot_output = TRUE),
+    estimate_impact(age='15y+', plot_output = TRUE),
+    nrow=2
+  )
+
+```
+
+## Final model selection
+
+### Fitting final models
+
+Based on the results above, each group should select the best-fit model(s) for which they would like to extract vaccine impact estimates for the cross-site comparison. All groups should include _at least_ one model estimating vaccine impact for all age groups over the first 2 years post-vaccination (or maximum time period available, if less than 2 years). If interested, groups may include other time periods of estimation (e.g., 0-1y, 2-4y, 0-5y), as determined based on model explorations above. We also recommend estimating each model for each age group, if data allows.
+
+We recommend that you use the same model (that is, the same adjustments for secular trends, seasonality, culture volumes) for all time periods/age groups. You can use the information above, including model AIC and plots of model fits, to determine which is the best model. We will define that model below using the function `create_model`, which takes in the same `age`, `start_window`, and `end_window` arguments as `estimate_impact`, plus additional TRUE/FALSE variables for whether to include secular trends (`incl_seculartrend`), seasonality (`incl_seasonality`), and culture volume (`incl_culture`) adjustments.
+
+```{r final models}
+
+  #' Let's create an empty data frame - we will add any impact estimates that you wish to include in the 
+  #' cross-site comparison to this data frame
+  out = data.frame()
+
+  # UPDATE: adjust and add additional models as needed. An example is shown below fitting model of 2-year 
+  #' impact for all ages with seasonal trends adjustment only.
+  #' 
+  #' For each fitted model, extract the impact estimates and add to the data frame `out`. Be sure to label 
+  #' the time period of estimation. Note that the variable `mod_label` will automatically use the site name
+  #'  you defined at the top of this document - this will help us to create the cross-site visualizations.
+  #'  
+  #'  Optionally, you can also plot the fit of each model, now with confidence intervals around the model-estimated 
+  #'  incidence. Uncomment the line after the `plot_mod_fit` function to save the figure as a PDF (you may 
+  #'  want to change the figure name too).
+  #'  
+
+  # UPDATE: change these to true as needed, to include these adjustments in your final model
+  final_incl_sectrend = FALSE
+  final_incl_season = FALSE
+  final_incl_culture = FALSE
+
+  mod_2y_all = create_model("All", start_window=0, end_window=24, incl_seculartrend = final_incl_sectrend, incl_seasonality = final_incl_season, incl_culture=final_incl_culture)
+  
+  est_2y_all = get_model_output(mod_2y_all, age="All", mod_label=site_name)
+  est_2y_all$time_period = "2y"
+  out = bind_rows(out, est_2y_all)
+  
+  plot_mod_fit(mod_2y_all, plot_title="2y, all ages")
+  # pdf("fit_2y_allage.pdf")  
+  
+```
+
+### Adding metadata
+
+To facilitate the cross-site comparison, we want to add certain metadata, particularly around vaccine coverage. Each group may have slightly different data available - this section will therefore likely require changes in the workshop as we learn more about which data are available in different sites. The workshop facilitators will advise on any additional changes to make here!
+
+Here, we provide code to add a few pieces of metadata:
+
+- `incl_seculartrend`, `incl_seasonality`, `incl_culture`: booleans for whether final model includes adjustments for secular trend, seasonality, or culture volumes
+- `vx_cov_all`, the maximum coverage achieved in the entire population at any time point
+- `vx_cov_u15`, the maximum coverage achieved in the <15y population at any time point
+- `vx_cov_target_pop`, the maximum coverage achieved in the target population for vaccination. This may be the same as `vx_cov_u15` if vaccination was offered to children up to 15y. 
+- `pct_target_pop`, an estimate of the percent of the entire population which was eligible for vaccination
+- `pre_vacc_inc`, the average incidence of typhoid infections in the pre-vaccine period, as a proxy for force of infection
+
+```{r}
+
+  out$incl_seculartrend = final_incl_sectrend
+  out$incl_seasonality = final_incl_season
+  out$incl_culture = final_incl_culture
+  
+  # UPDATE: decide which vaccine coverage data you can add to facilitate cross-site comparisons
+  #' Ideally, you will be able to provide information on the variables listed above. As appropriate,
+  #' though, facilitators may ask you to include coverage for other age groups or time periods
+  #' 
+  #' The code below saves the maximum coverage achieved in the total population and in the <15y 
+  #' population at any time in your dataset.
+  out$vx_cov_all = max(df_vxcov$coverage_all, na.rm=T)
+  out$vx_cov_u15 = max(df_vxcov$coverage_u15, na.rm=T)
+  
+  #' Let's say our vaccination campaign covered routine vaccination in the 9m - 15y population.
+  #' The most accurate representation, then, of coverage within the target population would be
+  #' the <15 coverage. Therefore, I save `vx_cov_u15` as `vx_cov_target_pop`.
+  out$vx_cov_target_pop = out$vx_cov_u15
+
+  #' If available, it will also be helpful to give a sense of the percent of the total
+  #' population which fell into the target population. In our example data, this was roughly 38%.
+  #' We'll add this as the variable `pct_target_pop`.
+  out$pct_target_pop = 0.38
+
+  #' Adding average incidence from the prevaccine period as a proxy of FOI
+  out$pre_vacc_inc = mean(df_allage$inc_per_100k[df_allage$ind_prepost==0 & df_allage$ind_include==1])
+  
+```
+
+### Saving results
+
+Once you have fit the appropriate models and **added those estimates to the data frame `out`**, the last step is to save `out` as a CSV. This CSV will be shared with the workshop facilitators to generate the cross-site comparison figures.
+
+```{r save}
+
+  write_csv(out, file=glue("impact_estimates_{site_name}.csv"))
+
+```
+
+# Secondary analyses
+
+The functions above can be used to estimate vaccine for outcomes other than total typhoid cases, such as severe typhoid cases or control outcomes like S. paratyphi cases. All of the functions above have an input `outcome_var` which refers to the column name of the model outcome of interest. By default `outcome_var` is equal to `"typhoid_cases"`, but can easily be changed to another outcome like `"typhoid_cases_severe"` or `"control_cases"`.
+
+The one trick is that these functions expect the outputs to exist in the data frames `df_allage` (for all age models) or `df_ages` (for age-specific models). For control outcomes, you may need to first merge your data frames
+(this way, we can also fit the control outcomes for the exact same time periods and vaccine pre/post indicators as used in the primary analysis above).
+
+We are providing some code here to get you started, including examples of fitting a model of impact on severe typhoid cases and a model with a control cases outcome, including code to read in and merge control cases with the primary `df_allage` and `df_ages` data frames. As above, you may need to reuse pieces of this code to fit and examine different models.
+
+**NOTE that these chunks have all been marked with `eval=FALSE`, meaning they will not run when you knit the Rmarkdown. Set `eval=TRUE` if you wish to include these chunks in your analysis.**
+
+## Example: severe typhoid cases
+
+The code below does several things:
+
+- plots incidence of severe cases, with pre/post and inclusion/exclusion indicators
+- fits and plots models of 2-year vaccine impact vs severe cases for all ages and for the 0-2y age group
+- extracts & makes table of model estimates
+
+```{r severe cases example, eval=FALSE}
+
+  # plot severe cases
+  ggplot(df_allage, aes(x=date, y=inc_severe_per_100k)) +
+    geom_line(aes(linetype=fac_prepost), width=0.7, color="gray30") +
+    geom_point(aes(color=fac_include)) +
+    scale_color_manual("", values=col2) +
+    scale_linetype("") +
+    scale_x_date("") +
+    scale_y_continuous("Incidence per 100K person-years") +
+    theme_bw()
+
+  # plots models of 2y impact for severe cases
+  estimate_impact(age='All', outcome_var = "typhoid_cases_severe", plot_output = TRUE)
+  estimate_impact(age='0-2y', outcome_var = "typhoid_cases_severe", plot_output = TRUE)
+  
+  # save + display model fits
+  all_sev = estimate_impact(age='All', outcome_var = "typhoid_cases_severe")
+  a1_sev = estimate_impact(age='0-2y', outcome_var = "typhoid_cases_severe")
+  
+  VE_sev = bind_rows(all_sev, a1_sev)
+  VE_sev$time_period = "2y"
+  
+  print_estimate_table(VE_sev)
+  
+```
+
+## Example: control cases
+
+The code below does several things:
+
+- reads in and formats the `control_cases` data frame
+- merges this data frame with the existing `df_allage` and `df_ages` dataframes, to retain the same pre/post and inclusion/exclusion indicators as above
+- plots incidence of controls cases vs typhoid cases, with pre/post and inclusion/exclusion indicators
+- fits and plots models of 2-year vaccine impact vs control cases for all ages and for the 0-2y age group
+- extracts & makes table of model estimates
+
+```{r control cases data load, eval=FALSE, fig.height=6, fig.width=8}
+
+  # load data
+  df_control <- read_excel(df_filepath, "control_cases")
+
+  # data checks
+  expected_control_columns = c("month", "year", "age_group", "control_cases")
+  expect_names(names(df_control), must.include=expected_control_columns, label="Control case data")
+
+  expect_numeric(df_control$month, any.missing=FALSE, finite=TRUE, lower=1, upper=12)
+  expect_numeric(df_control$year, any.missing=FALSE, finite=TRUE, lower=0)
+  expect_numeric(df_control$control_cases, lower=0)
+  expect_subset(df_control$age_group, choices = age_cat_labels)
+
+  # merge into df_allage, df_ages
+  df_ages <- df_ages %>%
+    left_join(df_control, by=c("month", "year", "age_group")) %>%
+    mutate(inc_control_per_100k = control_cases / (population * 1/12) * 100000)
+  
+  df_control_allage <- df_control %>%
+    group_by(month, year) %>%
+    summarise(across(c(control_cases), sum)) %>%
+    ungroup()
+  
+  df_allage <- df_allage %>%
+    left_join(df_control_allage, by=c("month", "year")) %>%
+    mutate(inc_control_per_100k = control_cases / (population * 1/12) * 100000)
+  
+  # plot control incidence & typhoid incidence
+  p1 <- ggplot(df_allage, aes(x=date, y=inc_per_100k)) +
+    geom_line(aes(linetype=fac_prepost), width=0.7, color="gray30") +
+    geom_point(aes(color=fac_include)) +
+    scale_color_manual("", values=col2) +
+    scale_linetype("") +
+    scale_x_date("") +
+    scale_y_continuous("Incidence typhoid cases\nper 100K person-years") +
+    theme_bw()
+    
+  p2 <- ggplot(df_allage, aes(x=date, y=inc_control_per_100k)) +
+    geom_line(aes(linetype=fac_prepost), width=0.7, color="gray30") +
+    geom_point(aes(color=fac_include)) +
+    scale_color_manual("", values=col2) +
+    scale_linetype("") +
+    scale_x_date("") +
+    scale_y_continuous("Incidence control cases\nper 100K person-years") +
+    theme_bw()
+  
+  p3 <- ggplot(data=df_ages, aes(x=date, y=inc_per_100k, group=age_fac, color=age_fac)) +
+    geom_line() +
+    scale_x_date("") +
+    scale_y_continuous("Incidence typhoid cases\nper 100K person-months") +
+    scale_color_manual("Age", values=col5) +
+    theme_bw()
+  
+  p4 <- ggplot(data=df_ages, aes(x=date, y=inc_control_per_100k, group=age_fac, color=age_fac)) +
+    geom_line() +
+    scale_x_date("") +
+    scale_y_continuous("Incidence typhoid cases\nper 100K person-months") +
+    scale_color_manual("Age", values=col5) +
+    theme_bw()
+  
+  plot_grid(p1, p2, p3, p4, nrow=2, align = "hv", labels = LETTERS[1:4])
+
+```
+
+
+```{r control cases example, eval=FALSE}
+
+  # plots models of 2y impact for control cases
+  estimate_impact(age='All', outcome_var = "control_cases", plot_output = TRUE)
+  estimate_impact(age='0-2y', outcome_var = "control_cases", plot_output = TRUE)
+  
+  # save + display model fits
+  all_control = estimate_impact(age='All', outcome_var = "control_cases")
+  a1_control = estimate_impact(age='0-2y', outcome_var = "control_cases")
+  
+  VE_control = bind_rows(all_control, a1_control)
+  VE_control$time_period = "2y"
+  
+  print_estimate_table(VE_control)
+  
+```
